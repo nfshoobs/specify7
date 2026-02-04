@@ -2,8 +2,8 @@ import type L from 'leaflet';
 import React from 'react';
 
 import { useBooleanState } from '../../hooks/useBooleanState';
-import { useLiveState } from '../../hooks/useLiveState';
 import { localityText } from '../../localization/locality';
+import { eventListener } from '../../utils/events';
 import { f } from '../../utils/functools';
 import type { RA, WritableArray } from '../../utils/types';
 import { filterArray } from '../../utils/types';
@@ -70,6 +70,7 @@ export function QueryToMap({
       {isOpen && ids.length > 0 ? (
         <QueryToMapDialog
           fields={fields}
+          fieldSpecs={fieldSpecs}
           localityMappings={localityMappings}
           results={results}
           tableName={table.name}
@@ -112,6 +113,8 @@ export function fieldSpecsToLocalityMappings(
   );
   return findLocalityColumnsInDataSet(tableName, splitPaths).map(
     (localityColumns) => {
+      // Only map coordinate fields (lat/long, etc.), NOT localityId
+      // We fetch localityId via API using the relationship path from the query
       const mapped = Object.entries(localityColumns)
         .filter(([key]) => queryMappingLocalityColumns.includes(key))
         .map(([localityColumn, mapping]) => {
@@ -125,17 +128,10 @@ export function fieldSpecsToLocalityMappings(
           };
         });
 
-      const basePath = splitJoinedMappingPath(
-        localityColumns['locality.longitude1']
-      ).slice(0, -1);
-      const idPath = mappingPathToString([...basePath, 'localityId']);
-      return [
-        ...mapped,
-        {
-          localityColumn: 'localityId',
-          columnIndex: mappingPaths.indexOf(idPath),
-        },
-      ];
+      // Don't try to add localityId mapping - it will be fetched via API
+      // This fixes the bug where DISTINCT queries don't include localityId
+      // in results, causing wrong IDs to be used
+      return mapped;
     }
   );
 }
@@ -157,6 +153,90 @@ type LocalityDataWithId = {
   readonly localityData: LocalityData;
 };
 
+// Extract the relationship path from latitude1/longitude1 field specs
+function getLocalityRelationshipPath(
+  fieldSpecs: RA<QueryFieldSpec>
+): string[] | undefined {
+  for (const fieldSpec of fieldSpecs) {
+    const mappingPath = fieldSpec.toMappingPath();
+    const pathString = mappingPathToString(mappingPath);
+    
+    // Find a locality field (lat1 or long1)
+    if (pathString.includes('.locality.latitude1') || 
+        pathString.includes('.locality.longitude1')) {
+      
+      // Extract relationship path segments
+      const pathSegments: string[] = [];
+      
+      for (const segment of mappingPath) {
+        if (typeof segment !== 'string') continue;
+        
+        // Stop after finding 'locality'
+        if (segment.toLowerCase() === 'locality') {
+          pathSegments.push(segment);
+          break;
+        }
+        
+        pathSegments.push(segment);
+      }
+      
+      // Return path excluding base table name
+      // e.g., for Agent->collectors->collectingEvent->locality
+      // returns ['collectors', 'collectingEvent', 'locality']
+      return pathSegments.slice(1);
+    }
+  }
+  
+  return undefined;
+}
+
+// Fetch localityId by following the relationship path via API
+async function fetchLocalityIdFromRecord(
+  tableName: keyof Tables,
+  recordId: number,
+  relationshipPath: string[]
+): Promise<number | undefined> {
+  try {
+    let currentUrl = `/api/specify/${tableName.toLowerCase()}/${recordId}/`;
+    
+    for (const relationshipName of relationshipPath) {
+      const response = await fetch(currentUrl, {
+        headers: { 'Accept': 'application/json' }
+      });
+      
+      if (!response.ok) return undefined;
+      
+      const data = await response.json();
+      
+      // If we've reached locality, return its ID
+      if (relationshipName.toLowerCase() === 'locality') {
+        return data.id;
+      }
+      
+      // Follow to next relationship
+      const nextUrl = data[relationshipName];
+      
+      if (!nextUrl) return undefined;
+      
+      // Handle collections (e.g., 'collectors')
+      if (Array.isArray(nextUrl)) {
+        if (nextUrl.length === 0) return undefined;
+        currentUrl = nextUrl[0];
+      } else {
+        currentUrl = nextUrl;
+      }
+    }
+    
+    return undefined;
+  } catch (error) {
+    console.error(
+      `Failed to fetch locality for ${tableName}:${recordId}`,
+      error
+    );
+    return undefined;
+  }
+}
+
 export function QueryToMapDialog({
   results,
   brokerData,
@@ -164,6 +244,7 @@ export function QueryToMapDialog({
   localityMappings,
   tableName,
   fields,
+  fieldSpecs,
   onClose: handleClose,
   onFetchMore: handleFetchMore,
 }: {
@@ -173,25 +254,24 @@ export function QueryToMapDialog({
   readonly localityMappings: RA<RA<LocalityColumn>>;
   readonly tableName: keyof Tables;
   readonly fields: RA<QueryField>;
+  readonly fieldSpecs: RA<QueryFieldSpec>;
   readonly onClose: () => void;
   readonly onFetchMore: (() => Promise<RA<QueryResultRow> | void>) | undefined;
 }): JSX.Element {
   const [map, setMap] = React.useState<LeafletInstance | undefined>(undefined);
   const localityData = React.useRef<RA<LocalityDataWithId>>([]);
-  const [initialData] = useLiveState<
+  const [initialData, setInitialData] = React.useState<
     | {
         readonly localityData: RA<LocalityData>;
         readonly onClick: ReturnType<typeof createClickCallback>;
       }
     | undefined
-  >(
-    React.useCallback(() => {
-      const extracted = extractLocalities(results, localityMappings);
-      return {
-        localityData: extracted.map(({ localityData }) => localityData),
-        onClick: createClickCallback(tableName, extracted),
-      };
-    }, [results])
+  >(undefined);
+
+  // Extract relationship path once - same for all locality fields
+  const relationshipPath = React.useMemo(
+    () => getLocalityRelationshipPath(fieldSpecs),
+    [fieldSpecs]
   );
 
   const taxonId = React.useMemo(
@@ -201,51 +281,80 @@ export function QueryToMapDialog({
   const data = useMapData(brokerData, taxonId);
   const description = useExtendedMap(map, data);
 
-  const markerCountRef = React.useRef(results.length);
+  const markerEvents = React.useMemo(
+    () => eventListener<{ readonly updated: undefined }>(),
+    []
+  );
 
   const handleAddPoints = React.useCallback(
-    (results: RA<QueryResultRow>) => {
-      markerCountRef.current += results.length;
+    async (results: RA<QueryResultRow>) => {
+      if (!relationshipPath) {
+        console.error('Could not determine path to locality from query fields');
+        return;
+      }
+
+      // Extract coordinate data from query results
+      const localitiesWithoutId = extractLocalities(results, localityMappings);
+      
+      // Fetch localityId for each record by following relationship path
+      const localitiesWithId = await Promise.all(
+        localitiesWithoutId.map(async ({ recordId, localityData }) => {
+          const localityId = await fetchLocalityIdFromRecord(
+            tableName,
+            recordId,
+            relationshipPath
+          );
+          
+          if (typeof localityId !== 'number') {
+            return undefined;
+          }
+          
+          return { recordId, localityId, localityData };
+        })
+      );
+      
+      const validLocalities = filterArray(localitiesWithId);
+      
       /*
        * Need to add markers into queue rather than directly to the map because
        * the map might not be initialized yet (the map is only initialized after
        * some markers are fetched, so that it can open to correct position)
        */
-      localityData.current = [
-        ...localityData.current,
-        ...extractLocalities(results, localityMappings),
-      ];
+      localityData.current = [...localityData.current, ...validLocalities];
+      
+      setInitialData((initialData) =>
+        typeof initialData === 'object'
+          ? initialData
+          : {
+              localityData: localityData.current.map(
+                ({ localityData }) => localityData
+              ),
+              onClick: createClickCallback(tableName, localityData.current),
+            }
+      );
+      markerEvents.trigger('updated');
+    },
+    [tableName, localityMappings, relationshipPath, markerEvents]
+  );
 
+  // Add initial results
+  React.useEffect(() => {
+    void handleAddPoints(results);
+  }, [handleAddPoints, results]);
+  
+  useFetchLoop(handleFetchMore, handleAddPoints);
+
+  React.useEffect(() => {
+    if (map === undefined) return undefined;
+
+    function emptyQueue(): void {
       if (map === undefined) return;
       addLeafletMarkers(tableName, map, localityData.current);
       localityData.current = [];
-    },
-    [tableName, localityMappings]
-  );
+    }
 
-  useFetchLoop(handleFetchMore, handleAddPoints);
-
-  /*
-   * The below is used for sanity checking at un-mount.
-   * A unit test for this functionality is tricky. A runtime check is simpler
-   */
-  const mapRef = React.useRef(map);
-  mapRef.current = map;
-
-  React.useEffect(
-    () => () => {
-      if (mapRef.current === undefined) return;
-      if (mapRef.current?.sp7MarkerCount !== markerCountRef.current) {
-        // This way, if the error happens in development mode, it can be caught more easily. (log checks may be easy to forget)
-        softFail(
-          new Error(
-            `Expected the counts to match: Expected: ${markerCountRef.current}. Got: ${mapRef.current?.sp7MarkerCount}`
-          )
-        );
-      }
-    },
-    []
-  );
+    return markerEvents.on('updated', emptyQueue, true);
+  }, [tableName, map, markerEvents]);
 
   return typeof initialData === 'object' ? (
     <LeafletMap
@@ -286,30 +395,51 @@ export function QueryToMapDialog({
   );
 }
 
+type LocalityDataWithoutId = {
+  readonly recordId: number;
+  readonly localityData: LocalityData;
+};
+
 const extractLocalities = (
   results: RA<QueryResultRow>,
   localityMappings: RA<RA<LocalityColumn>>
-): RA<LocalityDataWithId> =>
+): RA<LocalityDataWithoutId> =>
   filterArray(
     results.flatMap((row) =>
       localityMappings.map((mappings) => {
-        const fields = mappings.map(
-          ({ localityColumn, columnIndex }) =>
-            [
+        // Only extract coordinate fields, not localityId
+        const coordinateFields = mappings.filter(
+          ({ localityColumn }) => localityColumn !== 'localityId'
+        );
+        
+        const fields = coordinateFields.map(
+          ({ localityColumn, columnIndex }) => {
+            // "+1" is to compensate for queryIdField
+            const actualIndex = columnIndex + 1;
+            
+            // Validate index is within bounds
+            // (DISTINCT queries may have fewer columns than expected)
+            if (actualIndex >= row.length) {
+              return [[localityColumn], null] as const;
+            }
+            
+            return [
               [localityColumn],
-              // "+1" is to compensate for queryIdField
-              row[columnIndex + 1]?.toString() ?? null,
-            ] as const
+              row[actualIndex]?.toString() ?? null,
+            ] as const;
+          }
         );
+        
         const localityData = formatLocalityDataObject(fields);
-        const localityId = f.parseInt(
-          fields.find(
-            ([localityColumn]) => localityColumn[0] === 'localityId'
-          )?.[1] ?? undefined
-        );
-        return localityData === false || typeof localityId !== 'number'
-          ? undefined
-          : { recordId: row[queryIdField] as number, localityId, localityData };
+        
+        if (localityData === false) {
+          return undefined;
+        }
+        
+        return { 
+          recordId: row[queryIdField] as number,
+          localityData 
+        };
       })
     )
   );
